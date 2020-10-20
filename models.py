@@ -147,6 +147,7 @@ class DenseEncoder(tools.Module):
     self._act = act
 
   def __call__(self, features):
+    features = features['obs']
     x = features
     for index in range(self._layers):
       x = self.get(f'h{index}', tfkl.Dense, self._units, self._act)(x)

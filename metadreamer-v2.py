@@ -86,9 +86,10 @@ def define_config():
 
 class MetaDreamerV2(tools.Module):
 
-  def __init__(self, config, datadir, actspace, writer):
+  def __init__(self, config, datadir, obsspace, actspace, writer):
     self._c = config
     self._actspace = actspace
+    self._obsdim = obsspace['obs'].n if hasattr(obsspace['obs'], 'n') else obsspace['obs'].shape[0]
     self._actdim = actspace.n if hasattr(actspace, 'n') else actspace.shape[0]
     self._writer = writer
     self._random = np.random.RandomState(config.seed)
@@ -166,7 +167,7 @@ class MetaDreamerV2(tools.Module):
 
   def _train(self, data, log_images):
     with tf.GradientTape() as model_tape:
-      embed = self._encode(data['obs'])
+      embed = self._encode(data)
       post, prior = self._dynamics.observe(embed, data['action'])
       feat = self._dynamics.get_feat(post)
       obs_pred = self._decode(feat)
@@ -228,11 +229,11 @@ class MetaDreamerV2(tools.Module):
         elu=tf.nn.elu, relu=tf.nn.relu, swish=tf.nn.swish,
         leaky_relu=tf.nn.leaky_relu)
     act = acts[self._c.dense_act]
-    self._encode = models.DenseEncoder(self._c.num_units, self._c.dnn_depth,
+    self._encode = models.DenseEncoder((self._c.num_units,), self._c.dnn_depth,
                                        self._c.num_units)
     self._dynamics = models.RSSM(
         self._c.stoch_size, self._c.deter_size, self._c.deter_size)
-    self._decode = models.DenseDecoder(self._c.num_units, self._c.dnn_depth, 
+    self._decode = models.DenseDecoder((self._obsdim,), self._c.dnn_depth, 
                                        self._c.num_units)
     self._reward = models.DenseDecoder((), 2, self._c.num_units, act=act)
     if self._c.pcont:
@@ -311,7 +312,7 @@ class MetaDreamerV2(tools.Module):
     self._metrics['model_loss'].update_state(model_loss)
     self._metrics['value_loss'].update_state(value_loss)
     self._metrics['actor_loss'].update_state(actor_loss)
-    self._metrics['action_ent'].update_state(self._actor(feat).entropy())
+    self._metrics['action_ent'].update_state(tf.reduce_mean(self._actor(feat).entropy()))
 
   def _image_summaries(self, data, embed, image_pred):
     truth = data['image'][:6] + 0.5
@@ -436,6 +437,7 @@ def main(config):
       config, writer, 'test', datadir, store=False), config.parallel)
       for _ in range(config.envs)]
   actspace = train_envs[0].action_space
+  obsspace = train_envs[0].observation_space
 
   # Prefill dataset with random episodes.
   step = count_steps(datadir, config)
@@ -448,7 +450,7 @@ def main(config):
   # Train and regularly evaluate the agent.
   step = count_steps(datadir, config)
   print(f'Simulating agent for {config.steps-step} steps.')
-  agent = MetaDreamerV2(config, datadir, actspace, writer)
+  agent = MetaDreamerV2(config, datadir, obsspace, actspace, writer)
   if (config.logdir / 'variables.pkl').exists():
     print('Load checkpoint.')
     agent.load(config.logdir / 'variables.pkl')
