@@ -4,3 +4,8 @@ __pycache__/
 ./dist
 ./logdir
 MUJOCO_LOG.TXT
+.vscode/
+archived/
+logs/
+rough-work.ipynb
+runner.py

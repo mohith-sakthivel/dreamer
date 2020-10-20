@@ -61,6 +61,58 @@ class DeepMindControl:
       raise ValueError("Only render mode 'rgb_array' is supported.")
     return self._env.physics.render(*self._size, camera_id=self._camera)
 
+class DeepMindVectorControl:
+
+  def __init__(self, name):
+    domain, task = name.split('_', 1)
+    if domain == 'cup':  # Only domain with multiple words.
+      domain = 'ball_in_cup'
+    if isinstance(domain, str):
+      from dm_control import suite
+      self._env = suite.load(domain, task)
+    else:
+      assert task is None
+      self._env = domain()
+    self._size = (64, 64)
+
+  def unwrap_obs(self, obs_dict):
+    obs = []
+    for _, value in obs_dict.items():
+      obs.append(value.flatten())
+    obs = np.concatenate(obs, axis=0)
+    return {'obs': obs}
+
+  @property
+  def observation_space(self):
+    num_vals = 0
+    for _, value in self._env.observation_spec().items():
+      num_vals += np.prod(value.shape)
+    space = {'obs': gym.spaces.Box(-np.inf, np.inf, (int(num_vals.item()),), dtype=np.float32)}
+    return gym.spaces.Dict(space)
+
+  @property
+  def action_space(self):
+    spec = self._env.action_spec()
+    return gym.spaces.Box(spec.minimum, spec.maximum, dtype=np.float32)
+
+  def step(self, action):
+    time_step = self._env.step(action)
+    obs = self.unwrap_obs(time_step.observation)
+    reward = time_step.reward or 0
+    done = time_step.last()
+    info = {'discount': np.array(time_step.discount, np.float32)}
+    return obs, reward, done, info
+
+  def reset(self):
+    time_step = self._env.reset()
+    obs = self.unwrap_obs(time_step.observation)
+    return obs
+
+  def render(self, *args, **kwargs):
+    if kwargs.get('mode', 'rgb_array') != 'rgb_array':
+      raise ValueError("Only render mode 'rgb_array' is supported.")
+    return self._env.physics.render(*self._size)
+
 
 class Atari:
 
@@ -176,6 +228,7 @@ class Collect:
 
   def reset(self):
     obs = self._env.reset()
+    obs = {k: self._convert(v) for k, v in obs.items()}
     transition = obs.copy()
     transition['action'] = np.zeros(self._env.action_space.shape)
     transition['reward'] = 0.0
