@@ -28,7 +28,7 @@ import wrappers
 def define_config():
   config = tools.AttrDict()
   # General.
-  config.logdir = pathlib.Path('./logs/new_metadreamer/shot_2')
+  config.logdir = pathlib.Path('./logs/lowdim_dreamer/shot_1')
   config.seed = 0
   config.steps = 5e6
   config.eval_every = 1e4
@@ -53,6 +53,7 @@ def define_config():
   config.num_units = 200
   config.dense_act = 'elu'
   config.cnn_act = 'relu'
+  config.dnn_depth = 3
   config.pcont = False
   config.free_nats = 3.0
   config.kl_scale = 1.0
@@ -144,7 +145,8 @@ class MetaDreamerV2(tools.Module):
       action = tf.zeros((len(obs['obs']), self._actdim), self._float)
     else:
       latent, action = state
-    latent, _ = self._dynamics.obs_step(latent, action, obs['obs'])
+    embed = self._encode(preprocess(obs, self._c))
+    latent, _ = self._dynamics.obs_step(latent, action, embed)
     feat = self._dynamics.get_feat(latent)
     if training:
       action = self._actor(feat).sample()
@@ -164,10 +166,13 @@ class MetaDreamerV2(tools.Module):
 
   def _train(self, data, log_images):
     with tf.GradientTape() as model_tape:
-      post, prior = self._dynamics.observe(data['obs'], data['action'])
+      embed = self._encode(data['obs'])
+      post, prior = self._dynamics.observe(embed, data['action'])
       feat = self._dynamics.get_feat(post)
+      obs_pred = self._decode(feat)
       reward_pred = self._reward(feat)
       likes = tools.AttrDict()
+      likes.obs = tf.reduce_mean(obs_pred.log_prob(data['obs']))
       likes.reward = tf.reduce_mean(reward_pred.log_prob(data['reward']))
       if self._c.pcont:
         pcont_pred = self._pcont(feat)
@@ -223,8 +228,12 @@ class MetaDreamerV2(tools.Module):
         elu=tf.nn.elu, relu=tf.nn.relu, swish=tf.nn.swish,
         leaky_relu=tf.nn.leaky_relu)
     act = acts[self._c.dense_act]
+    self._encode = models.DenseEncoder(self._c.num_units, self._c.dnn_depth,
+                                       self._c.num_units)
     self._dynamics = models.RSSM(
         self._c.stoch_size, self._c.deter_size, self._c.deter_size)
+    self._decode = models.DenseDecoder(self._c.num_units, self._c.dnn_depth, 
+                                       self._c.num_units)
     self._reward = models.DenseDecoder((), 2, self._c.num_units, act=act)
     if self._c.pcont:
       self._pcont = models.DenseDecoder(
@@ -233,7 +242,7 @@ class MetaDreamerV2(tools.Module):
     self._actor = models.ActionDecoder(
         self._actdim, 4, self._c.num_units, self._c.action_dist,
         init_std=self._c.action_init_std, act=act)
-    model_modules = [ self._dynamics, self._reward]
+    model_modules = [self._encode, self._dynamics, self._decode, self._reward]
     if self._c.pcont:
       model_modules.append(self._pcont)
     Optimizer = functools.partial(

@@ -138,6 +138,22 @@ class DenseDecoder(tools.Module):
       return tfd.Independent(tfd.Bernoulli(x), len(self._shape))
     raise NotImplementedError(self._dist)
 
+class DenseEncoder(tools.Module):
+
+  def __init__(self, shape, layers, units,  act=tf.nn.elu):
+    self._shape = shape
+    self._layers = layers
+    self._units = units
+    self._act = act
+
+  def __call__(self, features):
+    x = features
+    for index in range(self._layers):
+      x = self.get(f'h{index}', tfkl.Dense, self._units, self._act)(x)
+    x = self.get(f'hout', tfkl.Dense, np.prod(self._shape), self._act)(x)
+    x = tf.reshape(x, tf.concat([tf.shape(features)[:-1], self._shape], 0))
+    return x
+
 
 class ActionDecoder(tools.Module):
 
