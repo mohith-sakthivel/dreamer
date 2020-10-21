@@ -1,3 +1,10 @@
+############################################################################
+# Metadreamer-v2:
+#   - Dreamer with with Conv layers replaced with Dense Layers 
+#   - Conv Encoder can be removed (by replacing self._encode)
+#     i.e. Observation can be directly used as an embedding
+############################################################################
+
 import argparse
 import collections
 import functools
@@ -28,7 +35,7 @@ import wrappers
 def define_config():
   config = tools.AttrDict()
   # General.
-  config.logdir = pathlib.Path('./logs/lowdim_dreamer/shot_1')
+  config.logdir = pathlib.Path('./logs')
   config.seed = 0
   config.steps = 5e6
   config.eval_every = 1e4
@@ -231,6 +238,7 @@ class MetaDreamerV2(tools.Module):
     act = acts[self._c.dense_act]
     self._encode = models.DenseEncoder((self._c.num_units,), self._c.dnn_depth,
                                        self._c.num_units)
+    # self._encode = lambda x: x['obs']
     self._dynamics = models.RSSM(
         self._c.stoch_size, self._c.deter_size, self._c.deter_size)
     self._decode = models.DenseDecoder((self._obsdim,), self._c.dnn_depth, 
