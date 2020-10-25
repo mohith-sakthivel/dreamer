@@ -55,9 +55,10 @@ def define_config():
   config.eval_noise = 0.0
   config.clip_rewards = 'none'
   # Model.
-  config.deter_size = 100
-  config.stoch_size = 15
+  config.deter_size = 200
+  config.stoch_size = 30
   config.num_units = 200
+  config.embed_size = 50
   config.dense_act = 'elu'
   config.cnn_act = 'relu'
   config.dnn_depth = 3
@@ -236,7 +237,7 @@ class MetaDreamerV2(tools.Module):
         elu=tf.nn.elu, relu=tf.nn.relu, swish=tf.nn.swish,
         leaky_relu=tf.nn.leaky_relu)
     act = acts[self._c.dense_act]
-    self._encode = models.DenseEncoder((self._c.num_units,), self._c.dnn_depth,
+    self._encode = models.DenseEncoder((self._c.embed_size,), self._c.dnn_depth,
                                        self._c.num_units)
     # self._encode = lambda x: x['obs']
     self._dynamics = models.RSSM(
@@ -402,6 +403,10 @@ def make_env(config, writer, prefix, datadir, store):
   suite, task = config.task.split('_', 1)
   if suite == 'dmc':
     env = wrappers.DeepMindVectorControl(task)
+    env = wrappers.ActionRepeat(env, config.action_repeat)
+    env = wrappers.NormalizeActions(env)
+  elif suite == 'gym':
+    env = wrappers.GymContControl(task)
     env = wrappers.ActionRepeat(env, config.action_repeat)
     env = wrappers.NormalizeActions(env)
   elif suite == 'atari':
