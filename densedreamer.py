@@ -55,10 +55,10 @@ def define_config():
   config.eval_noise = 0.0
   config.clip_rewards = 'none'
   # Model.
-  config.deter_size = 200
+  config.deter_size = 100
   config.stoch_size = 30
   config.num_units = 200
-  config.embed_size = 50
+  config.embed_size = 60
   config.dense_act = 'elu'
   config.cnn_act = 'relu'
   config.dnn_depth = 3
