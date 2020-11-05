@@ -41,6 +41,8 @@ def define_config():
   config.seed = 0
   config.steps = 5e6
   config.eval_every = 1e4
+  config.study_every = 5e4
+  config.study_episodes = 5
   config.log_every = 1e3
   config.log_scalars = True
   config.log_images = False
@@ -48,7 +50,7 @@ def define_config():
   config.distributed = True
   config.precision = 16
   # Environment.
-  config.task = 'dmc_walker_walk'
+  config.task = 'dmc_walker_walk-v0'
   config.envs = 1
   config.parallel = 'none'
   config.action_repeat = 2
@@ -57,10 +59,10 @@ def define_config():
   config.eval_noise = 0.0
   config.clip_rewards = 'none'
   # Model.
-  config.deter_size = 100
-  config.stoch_size = 30
-  config.num_units = 200
-  config.embed_size = 60
+  config.deter_size = 50
+  config.stoch_size = 15
+  config.num_units = 100
+  config.embed_size = 30
   config.dense_act = 'elu'
   config.cnn_act = 'relu'
   config.dnn_depth = 3
@@ -129,7 +131,7 @@ class MetaDreamerV2(tools.Module):
     if state is not None and reset.any():
       mask = tf.cast(1 - reset, self._float)[:, None]
       state = tf.nest.map_structure(lambda x: x * mask, state)
-    if self._should_train(step):
+    if training and self._should_train(step):
       log = self._should_log(step)
       n = self._c.pretrain if self._should_pretrain() else self._c.train_steps
       print(f'Training for {n} steps.')
@@ -400,15 +402,68 @@ def summarize_episode(episode, config, datadir, writer, prefix):
     # if prefix == 'test':
     #   tools.video_summary(f'sim/{prefix}/video', episode['image'][None])
 
+class StudyBehaviour:
+  def __init__(self, batch_size, vid_logdir, fps=20):
+    self._batch_size = batch_size
+    self._vid_logdir = vid_logdir
+    self._fps = fps
 
-def make_env(config, writer, prefix, datadir, store):
+    self._b_step = None
+    self._b_data = {}
+    self._b_size = 0
+
+  def _load_metrics(self, metrics):
+    for key, val in metrics:
+      if key in self._b_data:
+        self._b_data[key].append(val)
+      else:
+        self._b_data[key] = [val]
+    self._b_size += 1
+
+  def _write_logs(self, writer):
+    with writer.as_default():  # Env might run in a different thread.
+      tf.summary.experimental.set_step(self._b_step)
+      for key, values in self._b_data.items():
+        tf.summary.scalar(key + '/mean', np.mean(values))
+        tf.summary.scalar(key + '/max', np.max(values))
+        tf.summary.scalar(key + '/min', np.min(values))
+
+    self._b_step = None
+    self._b_size = 0
+    self._b_data = {}
+
+  def __call__(self, episode, config, datadir, writer, prefix):
+    if self._b_step is None:
+      self._b_step = count_steps(datadir, config)
+
+    length = (len(episode['reward']) - 1) * config.action_repeat
+    ret = episode['reward'].sum()
+    print(f'{prefix.title()} episode of length {length} with return {ret:.1f}.')
+    metrics = [
+        (f'{prefix}/return', float(ret)),
+        (f'{prefix}/length', len(episode['reward']) - 1)]
+    
+    self._load_metrics(metrics)
+    with (config.logdir / 'metrics.jsonl').open('a') as f:
+      f.write(json.dumps(dict([('step', self._b_step)] + metrics)) + '\n')
+
+    dir = self._vid_logdir / 'step_{}'.format(self._b_step)
+    dir.mkdir(parents=True, exist_ok=True)
+    name = 'ep_{}_len_{}_ret_{}.mp4'.format(self._b_size, length, ret)
+    logger.make_video(episode['image'], str(dir / name), self._fps)
+    
+    if self._b_size == self._batch_size:
+      self._write_logs(writer)
+
+
+def make_env(config, writer, prefix, datadir, store, get_imgs=False):
   suite, task = config.task.split('_', 1)
   if suite == 'dmc':
-    env = wrappers.DeepMindVectorControl(task)
+    env = wrappers.DeepMindVectorControl(task, get_imgs)
     env = wrappers.ActionRepeat(env, config.action_repeat)
     env = wrappers.NormalizeActions(env)
   elif suite == 'gym':
-    env = wrappers.GymContControl(task)
+    env = wrappers.GymContControl(task, get_imgs)
     env = wrappers.ActionRepeat(env, config.action_repeat)
     env = wrappers.NormalizeActions(env)
   elif suite == 'atari':
@@ -422,8 +477,14 @@ def make_env(config, writer, prefix, datadir, store):
   callbacks = []
   if store:
     callbacks.append(lambda ep: tools.save_episodes(datadir, [ep]))
-  callbacks.append(
-      lambda ep: summarize_episode(ep, config, datadir, writer, prefix))
+  if prefix != 'study':
+    callbacks.append(
+        lambda ep: summarize_episode(ep, config, datadir, writer, prefix))
+  else:
+    record_behaviour = StudyBehaviour(config.study_episodes,
+                                      config.logdir/'videos', env.fps)
+    callbacks.append(
+        lambda ep: record_behaviour(ep, config, datadir, writer, prefix))
   env = wrappers.Collect(env, callbacks, config.precision)
   env = wrappers.RewardObs(env)
   return env
@@ -440,6 +501,7 @@ def main(config):
   config.logdir.mkdir(parents=True, exist_ok=True)
   print('Logdir', config.logdir)
   logger.save_config(config)
+  assert config.study_every is None or (config.study_every/config.eval_every) >= 5
 
   # Create environments.
   datadir = config.logdir / 'episodes'
@@ -452,6 +514,11 @@ def main(config):
   test_envs = [wrappers.Async(lambda: make_env(
       config, writer, 'test', datadir, store=False), config.parallel)
       for _ in range(config.envs)]
+  if config.study_every is not None:
+    study_envs = [wrappers.Async(lambda: make_env(
+        config, writer, 'study', datadir, store=False, get_imgs=True), config.parallel)
+        for _ in range(config.envs)]
+  should_study = logger.IntervalCheck(config.study_every)
   actspace = train_envs[0].action_space
   obsspace = train_envs[0].observation_space
 
@@ -472,6 +539,12 @@ def main(config):
     agent.load(config.logdir / 'variables.pkl')
   state = None
   while step < config.steps:
+    if should_study(step):
+      print('Start study runs.')
+      tools.simulate(
+        functools.partial(agent, training=False), study_envs,
+                          episodes=config.study_episodes)
+      writer.flush()
     print('Start evaluation.')
     tools.simulate(
         functools.partial(agent, training=False), test_envs, episodes=1)
