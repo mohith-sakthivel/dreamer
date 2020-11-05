@@ -18,14 +18,12 @@ class HalfCheetahEnv(HalfCheetahEnv_):
         # Hide the overlay
         self.viewer._hide_overlay = True
 
-
-    def render(self, mode='human'):
-        if mode == 'rgb_array':
-            self._get_viewer().render()
-            # window size used for old mujoco-py:
-            width, height = 500, 500
-            data = self._get_viewer().read_pixels(width, height, depth=False)
-            return data
-        elif mode == 'human':
-            self._get_viewer().render()
-            
+# def render(self, mode='human'):
+#         if mode == 'rgb_array':
+#             self._get_viewer().render()
+#             # window size used for old mujoco-py:
+#             width, height = 500, 500
+#             data = self._get_viewer().read_pixels(width, height, depth=False)
+#             return data
+#         elif mode == 'human':
+#             self._get_viewer().render()
