@@ -63,7 +63,7 @@ class DeepMindControl:
 
 class DeepMindVectorControl:
 
-  def __init__(self, name):
+  def __init__(self, name, get_imgs=False):
     domain, task = name.split('_', 1)
     if domain == 'cup':  # Only domain with multiple words.
       domain = 'ball_in_cup'
@@ -73,7 +73,11 @@ class DeepMindVectorControl:
     else:
       assert task is None
       self._env = domain()
-    self._size = (64, 64)
+    self._get_imgs = get_imgs
+    self.fps = int(1.0/self._env.control_timestep())
+    if self._get_imgs:
+      self._size = (256, 256)
+      self._camera = dict(quadruped=2).get(domain, 0)
 
   def unwrap_obs(self, obs_dict):
     obs = []
@@ -98,6 +102,7 @@ class DeepMindVectorControl:
   def step(self, action):
     time_step = self._env.step(action)
     obs = self.unwrap_obs(time_step.observation)
+    if self._get_imgs:  obs['image'] = self.render()
     reward = time_step.reward or 0
     done = time_step.last()
     info = {'discount': np.array(time_step.discount, np.float32)}
@@ -106,22 +111,26 @@ class DeepMindVectorControl:
   def reset(self):
     time_step = self._env.reset()
     obs = self.unwrap_obs(time_step.observation)
+    if self._get_imgs:  obs['image'] = self.render()
     return obs
 
   def render(self, *args, **kwargs):
     if kwargs.get('mode', 'rgb_array') != 'rgb_array':
       raise ValueError("Only render mode 'rgb_array' is supported.")
-    return self._env.physics.render(*self._size)
+    return self._env.physics.render(*self._size, camera_id=self._camera)
 
 
 class GymContControl:
 
     LOCK = threading.Lock()
 
-    def __init__(self, name):
+    def __init__(self, name, get_imgs=False, reset_task=True):
         import gym
+        self._reset_task = reset_task
         with self.LOCK:
           self._env = gym.make(name)
+        self._get_imgs=get_imgs
+        self.fps = self._env.metadata['video.frames_per_second']
 
     @property
     def observation_space(self):
@@ -137,12 +146,16 @@ class GymContControl:
 
     def reset(self):
       with self.LOCK:
-        obs = self._env.reset()
-        return {'obs': obs}
+        if hasattr(self._env, 'context') and self._reset_task:
+          self._env.set_task(self._env.sample_tasks(1)[0])
+        obs = {'obs': self._env.reset()}
+        if self._get_imgs:  obs['image'] = self.render(mode='rgb_array')
+        return obs
 
     def step(self, action):
         obs, reward, done, info = self._env.step(action)
         obs = {'obs': obs}
+        if self._get_imgs:  obs['image'] = self.render(mode='rgb_array')
         return obs, reward, done, info
 
     def render(self, mode):

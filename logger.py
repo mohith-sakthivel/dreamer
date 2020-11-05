@@ -1,4 +1,5 @@
 import json
+import cv2
 
 import os.path as osp
 
@@ -80,3 +81,23 @@ def save_config(config):
         print('Saving config...')
         with open(osp.join(config.logdir, "config.json"), 'w') as out:
             out.write(output)
+
+def make_video(img_list, video_dir='videos/vid.mp4', fps=20):
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
+    img_list = [cv2.resize(img, (256, 256)) for img in img_list]
+    height, width = img_list[0].shape[:-1]
+    out = cv2.VideoWriter(video_dir, fourcc, fps, (width, height))
+    for image in img_list:  
+        out.write(image)
+    out.release()
+
+class IntervalCheck():
+    def __init__(self, interval=None):
+        self._interval = interval
+        self._last = 0
+
+    def __call__(self, curr_counter):
+        if self._interval is not None and  (curr_counter // self._interval) > self._last:
+            self._last = curr_counter // self._interval
+            return True
+        return False
