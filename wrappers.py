@@ -118,8 +118,9 @@ class GymContControl:
 
     LOCK = threading.Lock()
 
-    def __init__(self, name):
+    def __init__(self, name, reset_task=True):
         import gym
+        self._reset_task = reset_task
         with self.LOCK:
           self._env = gym.make(name)
 
@@ -137,6 +138,8 @@ class GymContControl:
 
     def reset(self):
       with self.LOCK:
+        if hasattr(self._env, 'context') and self._reset_task:
+          self._env.set_task(self._env.sample_tasks(1)[0])
         obs = self._env.reset()
         return {'obs': obs}
 
