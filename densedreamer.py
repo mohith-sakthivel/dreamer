@@ -41,7 +41,7 @@ def define_config():
   config.seed = 0
   config.steps = 5e6
   config.eval_every = 1e4
-  config.study_every = 5e4
+  config.study_every = 1e5
   config.study_episodes = 5
   config.log_every = 1e3
   config.log_scalars = True
