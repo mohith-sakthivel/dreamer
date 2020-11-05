@@ -30,6 +30,7 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 import models
 import tools
 import wrappers
+import logger
 
 
 def define_config():
@@ -437,6 +438,7 @@ def main(config):
   config.steps = int(config.steps)
   config.logdir.mkdir(parents=True, exist_ok=True)
   print('Logdir', config.logdir)
+  logger.save_config(config)
 
   # Create environments.
   datadir = config.logdir / 'episodes'
