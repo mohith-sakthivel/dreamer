@@ -191,3 +191,9 @@ class ActionDecoder(tools.Module):
     else:
       raise NotImplementedError(dist)
     return dist
+
+
+class DenseDecoderV2(DenseDecoder):
+    def __init__(self, inp_dim, *args, **kwargs):
+        super(DenseDecoderV2, self).__init__(*args, **kwargs)
+        _ = self.__call__(tf.random.normal((1,) + inp_dim))
