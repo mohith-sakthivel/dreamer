@@ -50,7 +50,7 @@ def define_config():
   config.distributed = True
   config.precision = 16
   # Environment.
-  config.task = 'dmc_walker_walk-v0'
+  config.task = 'dmc_walker_walk'
   config.envs = 1
   config.parallel = 'none'
   config.action_repeat = 2
@@ -59,10 +59,10 @@ def define_config():
   config.eval_noise = 0.0
   config.clip_rewards = 'none'
   # Model.
-  config.deter_size = 50
-  config.stoch_size = 15
-  config.num_units = 100
-  config.embed_size = 30
+  config.deter_size = 100
+  config.stoch_size = 30
+  config.num_units = 200
+  config.embed_size = 60
   config.dense_act = 'elu'
   config.cnn_act = 'relu'
   config.dnn_depth = 3

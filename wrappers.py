@@ -75,9 +75,8 @@ class DeepMindVectorControl:
       self._env = domain()
     self._get_imgs = get_imgs
     self.fps = int(1.0/self._env.control_timestep())
-    if self._get_imgs:
-      self._size = (256, 256)
-      self._camera = dict(quadruped=2).get(domain, 0)
+    self._size = (256, 256)
+    self._camera = dict(quadruped=2).get(domain, 0)
 
   def unwrap_obs(self, obs_dict):
     obs = []
