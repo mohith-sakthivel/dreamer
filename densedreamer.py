@@ -96,7 +96,7 @@ def define_config():
   return config
 
 
-class MetaDreamerV2(tools.Module):
+class DenseDreamer(tools.Module):
 
   def __init__(self, config, datadir, obsspace, actspace, writer):
     self._c = config
@@ -533,7 +533,7 @@ def main(config):
   # Train and regularly evaluate the agent.
   step = count_steps(datadir, config)
   print(f'Simulating agent for {config.steps-step} steps.')
-  agent = MetaDreamerV2(config, datadir, obsspace, actspace, writer)
+  agent = DenseDreamer(config, datadir, obsspace, actspace, writer)
   if (config.logdir / 'variables.pkl').exists():
     print('Load checkpoint.')
     agent.load(config.logdir / 'variables.pkl')
