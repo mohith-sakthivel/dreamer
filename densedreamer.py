@@ -37,7 +37,7 @@ import logger
 def define_config():
   config = tools.AttrDict()
   # General.
-  config.logdir = pathlib.Path('./logs')
+  config.logdir = pathlib.Path('./logs/one')
   config.seed = 0
   config.steps = 5e6
   config.eval_every = 1e4
@@ -122,6 +122,7 @@ class DenseDreamer(tools.Module):
             load_dataset(datadir, self._c)))
         self._build_model()
     else:
+      tf.config.experimental_run_functions_eagerly(True)
       self._dataset = iter(load_dataset(datadir, self._c))
       self._build_model()
 
@@ -135,15 +136,15 @@ class DenseDreamer(tools.Module):
       log = self._should_log(step)
       n = self._c.pretrain if self._should_pretrain() else self._c.train_steps
       print(f'Training for {n} steps.')
-      if self._c.distributed:
-        with self._strategy.scope():
-          for train_step in range(n):
-            log_images = self._c.log_images and log and train_step == 0
-            self.train(next(self._dataset), log_images)
-      else:
+      def train_agent():
         for train_step in range(n):
           log_images = self._c.log_images and log and train_step == 0
-          self._train(next(self._dataset), log_images)
+          self.train(next(self._dataset), log_images)
+      if self._c.distributed:
+        with self._strategy.scope():
+          train_agent()
+      else:
+        train_agent()
       if log:
         self._write_summaries()
     action, state = self.policy(obs, state, training)
@@ -175,7 +176,10 @@ class DenseDreamer(tools.Module):
 
   @tf.function()
   def train(self, data, log_images=False):
-    self._strategy.experimental_run_v2(self._train, args=(data, log_images))
+    if self._c.distributed:
+      self._strategy.experimental_run_v2(self._train, args=(data, log_images))
+    else:
+      self._train(next(self._dataset), log_images)
 
   def _train(self, data, log_images):
     with tf.GradientTape() as model_tape:
@@ -268,10 +272,7 @@ class DenseDreamer(tools.Module):
     # Do a train step to initialize all variables, including optimizer
     # statistics. Ideally, we would use batch size zero, but that doesn't work
     # in multi-GPU mode.
-    if self._c.distributed:
-      self.train(next(self._dataset))
-    else:
-      self._train(next(self._dataset), False)
+    self.train(next(self._dataset))
 
   def _exploration(self, action, training):
     if training:
