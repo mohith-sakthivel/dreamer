@@ -37,7 +37,7 @@ import logger
 def define_config():
   config = tools.AttrDict()
   # General.
-  config.logdir = pathlib.Path('./logs/one')
+  config.logdir = pathlib.Path('./logs')
   config.seed = 0
   config.steps = 5e6
   config.eval_every = 1e4
