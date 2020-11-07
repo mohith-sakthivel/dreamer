@@ -181,9 +181,8 @@ class ActionDecoder(tools.Module):
       mean, std = tf.split(x, 2, -1)
       mean = self._mean_scale * tf.tanh(mean / self._mean_scale)
       std = tf.nn.softplus(std + raw_init_std) + self._min_std
-      dist = tfd.Normal(mean, std)
+      dist = tfd.Independent(tfd.Normal(mean, std), 1)
       dist = tfd.TransformedDistribution(dist, tools.TanhBijector())
-      dist = tfd.Independent(dist, 1)
       dist = tools.SampleDist(dist)
     elif self._dist == 'onehot':
       x = self.get(f'hout', tfkl.Dense, self._size)(x)
