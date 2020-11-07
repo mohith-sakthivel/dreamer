@@ -30,15 +30,19 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 import models
 import tools
 import wrappers
+import environments
+import logger
 
 
 def define_config():
   config = tools.AttrDict()
   # General.
-  config.logdir = pathlib.Path('./logs/sac/walker/no_entropy')
+  config.logdir = pathlib.Path('./logs/sac/no_entropy')
   config.seed = 0
-  config.steps = 5e6
+  config.steps = 1e6
   config.eval_every = 1e4
+  config.study_every = 1e5
+  config.study_episodes = 5
   config.log_every = 1e3
   config.log_scalars = True
   config.log_images = False
@@ -55,10 +59,10 @@ def define_config():
   config.eval_noise = 0.0
   config.clip_rewards = 'none'
   # Model.
-  config.deter_size = 100
+  config.deter_size = 75
   config.stoch_size = 30
-  config.num_units = 200
-  config.embed_size = 60
+  config.num_units = 100
+  config.embed_size = 50
   config.dense_act = 'elu'
   config.cnn_act = 'relu'
   config.dnn_depth = 3
@@ -81,8 +85,8 @@ def define_config():
   config.dataset_balance = False
   # sac parameters
   config.entropy_coeff = 0
-  config.polyak_factor = 0.995
-  config.t_update_freq = None
+  config.polyak_factor = None
+  config.t_update_freq = 1
   # Behavior.
   config.discount = 0.99
   config.disclam = 0.95
@@ -96,7 +100,7 @@ def define_config():
   return config
 
 
-class MetaDreamerV2(tools.Module):
+class SoftDenseDreamer(tools.Module):
 
   def __init__(self, config, datadir, obsspace, actspace, writer):
     self._c = config
@@ -122,6 +126,7 @@ class MetaDreamerV2(tools.Module):
             load_dataset(datadir, self._c)))
         self._build_model()
     else:
+      tf.config.experimental_run_functions_eagerly(True)
       self._dataset = iter(load_dataset(datadir, self._c))
       self._build_model()
 
@@ -131,19 +136,19 @@ class MetaDreamerV2(tools.Module):
     if state is not None and reset.any():
       mask = tf.cast(1 - reset, self._float)[:, None]
       state = tf.nest.map_structure(lambda x: x * mask, state)
-    if self._should_train(step):
+    if training and self._should_train(step):
       log = self._should_log(step)
       n = self._c.pretrain if self._should_pretrain() else self._c.train_steps
       print(f'Training for {n} steps.')
-      if self._c.distributed:
-        with self._strategy.scope():
-          for train_step in range(n):
-            log_images = self._c.log_images and log and train_step == 0
-            self.train(next(self._dataset), log_images)
-      else:
+      def train_agent():
         for train_step in range(n):
           log_images = self._c.log_images and log and train_step == 0
-          self._train(next(self._dataset), log_images)
+          self.train(next(self._dataset), log_images)
+      if self._c.distributed:
+        with self._strategy.scope():
+          train_agent()
+      else:
+        train_agent()
       if log:
         self._write_summaries()
     action, state = self.policy(obs, state, training)
@@ -175,7 +180,11 @@ class MetaDreamerV2(tools.Module):
 
   @tf.function()
   def train(self, data, log_images=False):
-    self._strategy.experimental_run_v2(self._train, args=(data, log_images))
+    if self._c.distributed:
+      self._strategy.experimental_run_v2(self._train, args=(data, log_images))
+    else:
+      self._train(next(self._dataset), log_images)
+    [self._copy_weights(self._qvalue_t[i], self._qvalue[i]) for i in range(2)]
 
   def _train(self, data, log_images):
     with tf.GradientTape() as model_tape:
@@ -202,60 +211,50 @@ class MetaDreamerV2(tools.Module):
 
     with tf.GradientTape() as actor_tape:
       imag_feat, imag_act = self._imagine_ahead(post)
+      imag_st_act = tf.concat([imag_feat, imag_act['sample']], axis=-1)
       reward = self._reward(imag_feat[1:]).mode()
       qval_reward = reward - (self._c.entropy_coeff*self._c.discount) * imag_act['log_prob'][1:]
       if self._c.pcont:
         pcont = self._pcont(imag_feat[1:]).mean()
       else:
         pcont = self._c.discount * tf.ones_like(reward)
-      imag_st_act = tf.concat([imag_feat, imag_act['sample']], axis=-1)[:-1]
-      qvalue_1 = self._qvalue_1(imag_st_act).mode()
-      qvalue_2 = self._qvalue_2(imag_st_act).mode()
-      q_value = tf.minimum(qvalue_1, qvalue_2)
+      qvalue = [self._qvalue[i](imag_st_act).mode() for i in range(2)]
+      qvalue = tf.minimum(*qvalue)
       returns = tools.lambda_return(
-          qval_reward[:-1], q_value[:-1], pcont[:-1],
-          bootstrap=q_value[-1], lambda_=self._c.disclam, axis=0)
-      max_ent_return = returns - self._c.entropy_coeff * imag_act['log_prob'][:-2]
+          qval_reward, qvalue[:-1], pcont,
+          bootstrap=qvalue[-1], lambda_=self._c.disclam, axis=0)
+      max_ent_return = returns - self._c.entropy_coeff * imag_act['log_prob'][:-1]
       discount = tf.stop_gradient(tf.math.cumprod(tf.concat(
-          [tf.ones_like(pcont[:1]), pcont[:-2]], 0), 0))
+          [tf.ones_like(pcont[:1]), pcont[:-1]], 0), 0))
       actor_loss = -tf.reduce_mean(discount * max_ent_return)
       if self._c.distributed:
         actor_loss /= float(self._strategy.num_replicas_in_sync)
 
-    with tf.GradientTape() as qvalue_1_tape:
-      qvalue_1_t = self._qvalue_1_t(imag_st_act).mode()
-      qvalue_2_t = self._qvalue_2_t(imag_st_act).mode()
-      q_value_t = tf.minimum(qvalue_1_t, qvalue_2_t)
-      target = tf.stop_gradient(tools.lambda_return(
-                                  qval_reward[:-1], q_value_t[:-1], pcont[:-1],
-                                  bootstrap=q_value_t[-1], lambda_=self._c.disclam, axis=0))
-      qvalue_1_pred = self._qvalue_1(imag_st_act)[:-1]
-      qvalue_1_loss = -tf.reduce_mean(discount * qvalue_1_pred.log_prob(target))
-      if self._c.distributed:
-        qvalue_1_loss /= float(self._strategy.num_replicas_in_sync)
-
-    with tf.GradientTape() as qvalue_2_tape:
-      qvalue_2_pred = self._qvalue_2(imag_st_act)[:-1]
-      qvalue_2_loss = -tf.reduce_mean(discount * qvalue_2_pred.log_prob(target))
-      if self._c.distributed:
-        qvalue_2_loss /= float(self._strategy.num_replicas_in_sync)
-
+    qvalue_t = [self._qvalue_t[i](imag_st_act).mode() for i in range(2)]
+    qvalue_t = tf.minimum(*qvalue_t)
+    target = tf.stop_gradient(tools.lambda_return(
+                                qval_reward, qvalue_t[:-1], pcont,
+                                bootstrap=qvalue_t[-1], lambda_=self._c.disclam, axis=0))
+    qvalue_loss = []
+    qvalue_tape = []
+    for i in range(2):
+      with tf.GradientTape() as tape:
+        qvalue_pred = self._qvalue[i](imag_st_act)[:-1]
+        qvalue_loss.append(-tf.reduce_mean(discount * qvalue_pred.log_prob(target)))
+        if self._c.distributed:
+          qvalue_loss[i] /= float(self._strategy.num_replicas_in_sync)
+      qvalue_tape.append(tape)
 
     model_norm = self._model_opt(model_tape, model_loss)
     actor_norm = self._actor_opt(actor_tape, actor_loss)
-    qvalue_1_norm = self._qvalue_1_opt(qvalue_1_tape, qvalue_1_loss)
-    qvalue_2_norm = self._qvalue_2_opt(qvalue_2_tape, qvalue_2_loss)
-
-    self._copy_weights(self._qvalue_1_t, self._qvalue_1)
-    self._copy_weights(self._qvalue_2_t, self._qvalue_2)
+    qvalue_norm = [self._qvalue_opt[i](qvalue_tape[i], qvalue_loss[i]) for i in range(2)]
 
     if tf.distribute.get_replica_context().replica_id_in_sync_group == 0:
       if self._c.log_scalars:
         self._scalar_summaries(
             data, feat, prior_dist, post_dist, likes, div,
-            model_loss, qvalue_1_loss, qvalue_2_loss, actor_loss, model_norm,
-            qvalue_1_norm, qvalue_2_norm, actor_norm)
-
+            model_loss, qvalue_loss, actor_loss, model_norm,
+            qvalue_norm, actor_norm)
 
   def _build_model(self):
     acts = dict(
@@ -274,15 +273,17 @@ class MetaDreamerV2(tools.Module):
       self._pcont = models.DenseDecoder(
           (), 3, self._c.num_units, 'binary', act=act)
     q_input = (self._c.stoch_size + self._c.deter_size + self._actdim,)
-    self._qvalue_1 = models.DenseDecoderV2(q_input, (), 3, self._c.num_units, act=act)
-    self._qvalue_2 = models.DenseDecoderV2(q_input, (), 3, self._c.num_units, act=act)
-    self._qvalue_1_t = models.DenseDecoderV2(q_input, (), 3, self._c.num_units, act=act)
-    self._qvalue_2_t = models.DenseDecoderV2(q_input, (), 3, self._c.num_units, act=act)
-    self._copy_weights(self._qvalue_1_t, self._qvalue_1)
-    self._copy_weights(self._qvalue_2_t, self._qvalue_2)
+    self._qvalue = [models.DenseDecoderV2(q_input, (), 3, self._c.num_units, act=act)
+                      for _ in range(2)]
+    self._qvalue_t = [models.DenseDecoderV2(q_input, (), 3, self._c.num_units, act=act)
+                        for _ in range(2)]
+    [self._copy_weights(self._qvalue_t[i], self._qvalue[i]) for i in range(2)]
     self._actor = models.ActionDecoder(
         self._actdim, 4, self._c.num_units, self._c.action_dist,
         init_std=self._c.action_init_std, act=act)
+
+    self._target_entorpy = self._actdim
+
     model_modules = [self._encode, self._dynamics, self._decode, self._reward]
     if self._c.pcont:
       model_modules.append(self._pcont)
@@ -290,22 +291,24 @@ class MetaDreamerV2(tools.Module):
         tools.Adam, wd=self._c.weight_decay, clip=self._c.grad_clip,
         wdpattern=self._c.weight_decay_pattern)
     self._model_opt = Optimizer('model', model_modules, self._c.model_lr)
-    self._qvalue_1_opt = Optimizer('qvalue_1', [self._qvalue_1], self._c.value_lr)
-    self._qvalue_2_opt = Optimizer('qvalue_2', [self._qvalue_2], self._c.value_lr)
+    self._qvalue_opt = [Optimizer('qvalue_{}'.format(i+1), [self._qvalue[i]], self._c.value_lr)
+                          for i in range(2)]
     self._actor_opt = Optimizer('actor', [self._actor], self._c.actor_lr)
     # Do a train step to initialize all variables, including optimizer
     # statistics. Ideally, we would use batch size zero, but that doesn't work
     # in multi-GPU mode.
-    if self._c.distributed:
-      self.train(next(self._dataset))
-    else:
-      self._train(next(self._dataset), False)
+    self.train(next(self._dataset))
 
   def _copy_weights(self, net_t, net):
     if self._c.polyak_factor is not None:
       def polyak_avg(target, policy):
         target.assign(self._c.polyak_factor * target + (1 - self._c.polyak_factor) * policy)
       tf.nest.map_structure(polyak_avg, net_t.variables, net.variables)
+    elif self._c.t_update_freq is not None:
+      net_t._last_t_update = (net_t._last_t_update + 1) if hasattr(net_t, '_last_t_update') else 0
+      if net_t._last_t_update % self._c.t_update_freq == 0:
+        net_t._last_t_update = 0
+        tf.nest.map_structure(lambda x, y: x.assign(y), net_t.variables, net.variables)
 
   def _exploration(self, action, training):
     if training:
@@ -349,7 +352,7 @@ class MetaDreamerV2(tools.Module):
       return (self._dynamics.img_step(prev[0], action['sample']), action)
 
     states, actions = tools.static_scan(scan_fn,
-                            tf.range(self._c.horizon), (start, action))
+                        tf.range(self._c.horizon), (start, action))
     imag_feat = self._dynamics.get_feat(states)
     last_act = policy(imag_feat[-1:])
     imag_action = tf.nest.map_structure(lambda x, y: tf.concat([x, y], axis=0),
@@ -360,11 +363,11 @@ class MetaDreamerV2(tools.Module):
 
   def _scalar_summaries(
       self, data, feat, prior_dist, post_dist, likes, div,
-      model_loss, qvalue_1_loss, qvalue_2_loss, actor_loss,
-      model_norm, qvalue_1_norm, qvalue_2_norm, actor_norm):
+      model_loss, qvalue_loss, actor_loss, model_norm, qvalue_norm,
+      actor_norm):
     self._metrics['model_grad_norm'].update_state(model_norm)
-    self._metrics['qvalue_1_grad_norm'].update_state(qvalue_1_norm)
-    self._metrics['qvalue_2_grad_norm'].update_state(qvalue_2_norm)
+    [self._metrics['qvalue_{}_grad_norm'.format(i+1)].update_state(qvalue_norm[i])
+        for i in range(2)]
     self._metrics['actor_grad_norm'].update_state(actor_norm)
     self._metrics['prior_ent'].update_state(prior_dist.entropy())
     self._metrics['post_ent'].update_state(post_dist.entropy())
@@ -372,8 +375,8 @@ class MetaDreamerV2(tools.Module):
       self._metrics[name + '_loss'].update_state(-logprob)
     self._metrics['div'].update_state(div)
     self._metrics['model_loss'].update_state(model_loss)
-    self._metrics['qvalue_1_loss'].update_state(qvalue_1_loss)
-    self._metrics['qvalue_2_loss'].update_state(qvalue_2_loss)
+    [self._metrics['qvalue_{}_loss'.format(i+1)].update_state(qvalue_loss[i])
+        for i in range(2)]
     self._metrics['actor_loss'].update_state(actor_loss)
     self._metrics['action_ent'].update_state(tf.reduce_mean(self._actor(feat).entropy()))
 
@@ -452,15 +455,68 @@ def summarize_episode(episode, config, datadir, writer, prefix):
     # if prefix == 'test':
     #   tools.video_summary(f'sim/{prefix}/video', episode['image'][None])
 
+class StudyBehaviour:
+  def __init__(self, batch_size, vid_logdir, fps=20):
+    self._batch_size = batch_size
+    self._vid_logdir = vid_logdir
+    self._fps = fps
 
-def make_env(config, writer, prefix, datadir, store):
+    self._b_step = None
+    self._b_data = {}
+    self._b_size = 0
+
+  def _load_metrics(self, metrics):
+    for key, val in metrics:
+      if key in self._b_data:
+        self._b_data[key].append(val)
+      else:
+        self._b_data[key] = [val]
+    self._b_size += 1
+
+  def _write_logs(self, writer):
+    with writer.as_default():  # Env might run in a different thread.
+      tf.summary.experimental.set_step(self._b_step)
+      for key, values in self._b_data.items():
+        tf.summary.scalar(key + '/mean', np.mean(values))
+        tf.summary.scalar(key + '/max', np.max(values))
+        tf.summary.scalar(key + '/min', np.min(values))
+
+    self._b_step = None
+    self._b_size = 0
+    self._b_data = {}
+
+  def __call__(self, episode, config, datadir, writer, prefix):
+    if self._b_step is None:
+      self._b_step = count_steps(datadir, config)
+
+    length = (len(episode['reward']) - 1) * config.action_repeat
+    ret = episode['reward'].sum()
+    print(f'{prefix.title()} episode of length {length} with return {ret:.1f}.')
+    metrics = [
+        (f'{prefix}/return', float(ret)),
+        (f'{prefix}/length', len(episode['reward']) - 1)]
+    
+    self._load_metrics(metrics)
+    with (config.logdir / 'metrics.jsonl').open('a') as f:
+      f.write(json.dumps(dict([('step', self._b_step)] + metrics)) + '\n')
+
+    dir = self._vid_logdir / 'step_{}'.format(self._b_step)
+    dir.mkdir(parents=True, exist_ok=True)
+    name = 'ep_{}_len_{}_ret_{}.mp4'.format(self._b_size, length, ret)
+    logger.make_video(episode['image'], str(dir / name), self._fps)
+    
+    if self._b_size == self._batch_size:
+      self._write_logs(writer)
+
+
+def make_env(config, writer, prefix, datadir, store, get_imgs=False):
   suite, task = config.task.split('_', 1)
   if suite == 'dmc':
-    env = wrappers.DeepMindVectorControl(task)
+    env = wrappers.DeepMindVectorControl(task, get_imgs)
     env = wrappers.ActionRepeat(env, config.action_repeat)
     env = wrappers.NormalizeActions(env)
   elif suite == 'gym':
-    env = wrappers.GymContControl(task)
+    env = wrappers.GymContControl(task, get_imgs)
     env = wrappers.ActionRepeat(env, config.action_repeat)
     env = wrappers.NormalizeActions(env)
   elif suite == 'atari':
@@ -474,8 +530,14 @@ def make_env(config, writer, prefix, datadir, store):
   callbacks = []
   if store:
     callbacks.append(lambda ep: tools.save_episodes(datadir, [ep]))
-  callbacks.append(
-      lambda ep: summarize_episode(ep, config, datadir, writer, prefix))
+  if prefix != 'study':
+    callbacks.append(
+        lambda ep: summarize_episode(ep, config, datadir, writer, prefix))
+  else:
+    record_behaviour = StudyBehaviour(config.study_episodes,
+                                      config.logdir/'videos', env.fps)
+    callbacks.append(
+        lambda ep: record_behaviour(ep, config, datadir, writer, prefix))
   env = wrappers.Collect(env, callbacks, config.precision)
   env = wrappers.RewardObs(env)
   return env
@@ -491,6 +553,8 @@ def main(config):
   config.steps = int(config.steps)
   config.logdir.mkdir(parents=True, exist_ok=True)
   print('Logdir', config.logdir)
+  logger.save_config(config)
+  assert config.study_every is None or (config.study_every/config.eval_every) >= 5
 
   # Create environments.
   datadir = config.logdir / 'episodes'
@@ -503,6 +567,11 @@ def main(config):
   test_envs = [wrappers.Async(lambda: make_env(
       config, writer, 'test', datadir, store=False), config.parallel)
       for _ in range(config.envs)]
+  if config.study_every is not None:
+    study_envs = [wrappers.Async(lambda: make_env(
+        config, writer, 'study', datadir, store=False, get_imgs=True), config.parallel)
+        for _ in range(config.envs)]
+  should_study = logger.IntervalCheck(config.study_every)
   actspace = train_envs[0].action_space
   obsspace = train_envs[0].observation_space
 
@@ -517,12 +586,18 @@ def main(config):
   # Train and regularly evaluate the agent.
   step = count_steps(datadir, config)
   print(f'Simulating agent for {config.steps-step} steps.')
-  agent = MetaDreamerV2(config, datadir, obsspace, actspace, writer)
+  agent = SoftDenseDreamer(config, datadir, obsspace, actspace, writer)
   if (config.logdir / 'variables.pkl').exists():
     print('Load checkpoint.')
     agent.load(config.logdir / 'variables.pkl')
   state = None
   while step < config.steps:
+    if should_study(step):
+      print('Start study runs.')
+      tools.simulate(
+        functools.partial(agent, training=False), study_envs,
+                          episodes=config.study_episodes)
+      writer.flush()
     print('Start evaluation.')
     tools.simulate(
         functools.partial(agent, training=False), test_envs, episodes=1)

@@ -239,7 +239,6 @@ class DenseDreamer(tools.Module):
             model_loss, value_loss, actor_loss, model_norm, value_norm,
             actor_norm)
 
-
   def _build_model(self):
     acts = dict(
         elu=tf.nn.elu, relu=tf.nn.relu, swish=tf.nn.swish,
