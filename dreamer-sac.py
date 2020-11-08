@@ -14,11 +14,14 @@ import pathlib
 import sys
 import time
 
+from tensorflow.python.keras.backend import dtype
+
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['MUJOCO_GL'] = 'egl'
 
 import numpy as np
 import tensorflow as tf
+import tensorflow_probability as tfp
 from tensorflow.keras.mixed_precision import experimental as prec
 
 tf.get_logger().setLevel('ERROR')
@@ -37,7 +40,7 @@ import logger
 def define_config():
   config = tools.AttrDict()
   # General.
-  config.logdir = pathlib.Path('./logs/sac/no_entropy')
+  config.logdir = pathlib.Path('./logs/sac/entropy')
   config.seed = 0
   config.steps = 1e6
   config.eval_every = 1e4
@@ -81,10 +84,11 @@ def define_config():
   config.model_lr = 6e-4
   config.value_lr = 8e-5
   config.actor_lr = 8e-5
+  config.alpha_lr = 8e-5
   config.grad_clip = 100.0
   config.dataset_balance = False
   # sac parameters
-  config.entropy_coeff = 0
+  config.alpha = 'auto'
   config.polyak_factor = None
   config.t_update_freq = 1
   # Behavior.
@@ -213,17 +217,17 @@ class SoftDenseDreamer(tools.Module):
       imag_feat, imag_act = self._imagine_ahead(post)
       imag_st_act = tf.concat([imag_feat, imag_act['sample']], axis=-1)
       reward = self._reward(imag_feat[1:]).mode()
-      qval_reward = reward - (self._c.entropy_coeff*self._c.discount) * imag_act['log_prob'][1:]
+      qval_reward = reward - (self._alpha*self._c.discount) * imag_act['log_prob'][1:]
       if self._c.pcont:
         pcont = self._pcont(imag_feat[1:]).mean()
       else:
         pcont = self._c.discount * tf.ones_like(reward)
       qvalue = [self._qvalue[i](imag_st_act).mode() for i in range(2)]
-      qvalue = tf.minimum(*qvalue)
+      qvalue = tf.reduce_min(qvalue, axis=0)
       returns = tools.lambda_return(
           qval_reward, qvalue[:-1], pcont,
           bootstrap=qvalue[-1], lambda_=self._c.disclam, axis=0)
-      max_ent_return = returns - self._c.entropy_coeff * imag_act['log_prob'][:-1]
+      max_ent_return = returns - self._alpha * imag_act['log_prob'][:-1]
       discount = tf.stop_gradient(tf.math.cumprod(tf.concat(
           [tf.ones_like(pcont[:1]), pcont[:-1]], 0), 0))
       actor_loss = -tf.reduce_mean(discount * max_ent_return)
@@ -231,7 +235,7 @@ class SoftDenseDreamer(tools.Module):
         actor_loss /= float(self._strategy.num_replicas_in_sync)
 
     qvalue_t = [self._qvalue_t[i](imag_st_act).mode() for i in range(2)]
-    qvalue_t = tf.minimum(*qvalue_t)
+    qvalue_t = tf.reduce_min(qvalue_t, axis=0)
     target = tf.stop_gradient(tools.lambda_return(
                                 qval_reward, qvalue_t[:-1], pcont,
                                 bootstrap=qvalue_t[-1], lambda_=self._c.disclam, axis=0))
@@ -245,6 +249,16 @@ class SoftDenseDreamer(tools.Module):
           qvalue_loss[i] /= float(self._strategy.num_replicas_in_sync)
       qvalue_tape.append(tape)
 
+    if self._c.alpha == 'auto':
+      with tf.GradientTape() as alpha_tape:
+        alpha_loss = -tf.reduce_mean(
+                  self._alpha * tf.stop_gradient(imag_act['log_prob'][0] + self._target_entropy))
+        if self._c.distributed:
+            alpha_loss /= float(self._strategy.num_replicas_in_sync)
+      alpha_norm = self._alpha_opt(alpha_tape, alpha_loss)
+    else:
+      alpha_norm, alpha_loss = (0, 0)
+
     model_norm = self._model_opt(model_tape, model_loss)
     actor_norm = self._actor_opt(actor_tape, actor_loss)
     qvalue_norm = [self._qvalue_opt[i](qvalue_tape[i], qvalue_loss[i]) for i in range(2)]
@@ -253,8 +267,8 @@ class SoftDenseDreamer(tools.Module):
       if self._c.log_scalars:
         self._scalar_summaries(
             data, feat, prior_dist, post_dist, likes, div,
-            model_loss, qvalue_loss, actor_loss, model_norm,
-            qvalue_norm, actor_norm)
+            model_loss, qvalue_loss, actor_loss, alpha_loss, model_norm,
+            qvalue_norm, actor_norm, alpha_norm)
 
   def _build_model(self):
     acts = dict(
@@ -282,7 +296,14 @@ class SoftDenseDreamer(tools.Module):
         self._actdim, 4, self._c.num_units, self._c.action_dist,
         init_std=self._c.action_init_std, act=act)
 
-    self._target_entorpy = self._actdim
+    if self._c.alpha == 'auto':
+      self._target_entropy = self._actdim
+      self._log_alpha = tf.Variable(0.0, dtype=self._float)
+      self._alpha = tfp.util.DeferredTensor(self._log_alpha, tf.exp)
+      self._alpha_opt = tools.Adam('alpha', [], self._c.alpha_lr)
+      self._alpha_opt._variables = [self._log_alpha]
+    else:
+      self._alpha = self._c.alpha
 
     model_modules = [self._encode, self._dynamics, self._decode, self._reward]
     if self._c.pcont:
@@ -294,6 +315,7 @@ class SoftDenseDreamer(tools.Module):
     self._qvalue_opt = [Optimizer('qvalue_{}'.format(i+1), [self._qvalue[i]], self._c.value_lr)
                           for i in range(2)]
     self._actor_opt = Optimizer('actor', [self._actor], self._c.actor_lr)
+
     # Do a train step to initialize all variables, including optimizer
     # statistics. Ideally, we would use batch size zero, but that doesn't work
     # in multi-GPU mode.
@@ -363,8 +385,8 @@ class SoftDenseDreamer(tools.Module):
 
   def _scalar_summaries(
       self, data, feat, prior_dist, post_dist, likes, div,
-      model_loss, qvalue_loss, actor_loss, model_norm, qvalue_norm,
-      actor_norm):
+      model_loss, qvalue_loss, actor_loss, alpha_loss, model_norm, qvalue_norm,
+      actor_norm, alpha_norm):
     self._metrics['model_grad_norm'].update_state(model_norm)
     [self._metrics['qvalue_{}_grad_norm'.format(i+1)].update_state(qvalue_norm[i])
         for i in range(2)]
@@ -379,6 +401,10 @@ class SoftDenseDreamer(tools.Module):
         for i in range(2)]
     self._metrics['actor_loss'].update_state(actor_loss)
     self._metrics['action_ent'].update_state(tf.reduce_mean(self._actor(feat).entropy()))
+    if self._c.alpha == 'auto':
+      self._metrics['alpha'].update_state(tf.convert_to_tensor(self._alpha))
+      self._metrics['alpha_loss'].update_state(alpha_loss)
+      self._metrics['alpha_norm'].update_state(alpha_norm)
 
   def _image_summaries(self, data, embed, image_pred):
     truth = data['image'][:6] + 0.5
