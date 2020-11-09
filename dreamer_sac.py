@@ -248,6 +248,11 @@ class SoftDenseDreamer(tools.Module):
           qvalue_loss[i] /= float(self._strategy.num_replicas_in_sync)
       qvalue_tape.append(tape)
 
+    model_norm = self._model_opt(model_tape, model_loss)
+    actor_norm = self._actor_opt(actor_tape, actor_loss)
+    qvalue_norm = [self._qvalue_opt[i](qvalue_tape[i], qvalue_loss[i]) 
+                    for i in range(self._c.num_critics)]
+
     if self._c.alpha == 'auto':
       with tf.GradientTape() as alpha_tape:
         alpha_loss = -tf.reduce_mean(
@@ -258,17 +263,12 @@ class SoftDenseDreamer(tools.Module):
     else:
       alpha_norm, alpha_loss = (0, 0)
 
-    model_norm = self._model_opt(model_tape, model_loss)
-    actor_norm = self._actor_opt(actor_tape, actor_loss)
-    qvalue_norm = [self._qvalue_opt[i](qvalue_tape[i], qvalue_loss[i]) 
-                    for i in range(self._c.num_critics)]
-
     if tf.distribute.get_replica_context().replica_id_in_sync_group == 0:
       if self._c.log_scalars:
         self._scalar_summaries(
             data, feat, prior_dist, post_dist, likes, div,
-            model_loss, qvalue_loss, actor_loss, alpha_loss, model_norm,
-            qvalue_norm, actor_norm, alpha_norm)
+            model_loss, qvalue_loss, actor_loss, model_norm,
+            qvalue_norm, actor_norm, alpha_loss, alpha_norm)
 
   def _build_model(self):
     acts = dict(
@@ -297,7 +297,7 @@ class SoftDenseDreamer(tools.Module):
         init_std=self._c.action_init_std, act=act)
 
     if self._c.alpha == 'auto':
-      self._target_entropy = self._actdim
+      self._target_entropy = -self._actdim
       self._log_alpha = tf.Variable(0.0, dtype=self._float)
       self._alpha = tfp.util.DeferredTensor(self._log_alpha, tf.exp)
       self._alpha_opt = tools.Adam('alpha', [], self._c.alpha_lr)
@@ -385,8 +385,8 @@ class SoftDenseDreamer(tools.Module):
 
   def _scalar_summaries(
       self, data, feat, prior_dist, post_dist, likes, div,
-      model_loss, qvalue_loss, actor_loss, alpha_loss, model_norm, qvalue_norm,
-      actor_norm, alpha_norm):
+      model_loss, qvalue_loss, actor_loss, model_norm, qvalue_norm,
+      actor_norm, alpha_loss, alpha_norm):
     self._metrics['model_grad_norm'].update_state(model_norm)
     [self._metrics['qvalue_{}_grad_norm'.format(i+1)].update_state(qvalue_norm[i])
         for i in range(self._c.num_critics)]
