@@ -14,8 +14,6 @@ import pathlib
 import sys
 import time
 
-from tensorflow.python.keras.backend import dtype
-
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['MUJOCO_GL'] = 'egl'
 
@@ -40,9 +38,9 @@ import logger
 def define_config():
   config = tools.AttrDict()
   # General.
-  config.logdir = pathlib.Path('./logs/sac/entropy')
+  config.logdir = pathlib.Path('./logs')
   config.seed = 0
-  config.steps = 1e6
+  config.steps = 5e6
   config.eval_every = 1e4
   config.study_every = 1e5
   config.study_episodes = 5
@@ -90,7 +88,8 @@ def define_config():
   # sac parameters
   config.alpha = 'auto'
   config.polyak_factor = None
-  config.t_update_freq = 1
+  config.t_update_freq = 5
+  config.num_critics = 2
   # Behavior.
   config.discount = 0.99
   config.disclam = 0.95
@@ -188,7 +187,7 @@ class SoftDenseDreamer(tools.Module):
       self._strategy.experimental_run_v2(self._train, args=(data, log_images))
     else:
       self._train(next(self._dataset), log_images)
-    [self._copy_weights(self._qvalue_t[i], self._qvalue[i]) for i in range(2)]
+    [self._copy_weights(self._qvalue_t[i], self._qvalue[i]) for i in range(self._c.num_critics)]
 
   def _train(self, data, log_images):
     with tf.GradientTape() as model_tape:
@@ -222,7 +221,7 @@ class SoftDenseDreamer(tools.Module):
         pcont = self._pcont(imag_feat[1:]).mean()
       else:
         pcont = self._c.discount * tf.ones_like(reward)
-      qvalue = [self._qvalue[i](imag_st_act).mode() for i in range(2)]
+      qvalue = [self._qvalue[i](imag_st_act).mode() for i in range(self._c.num_critics)]
       qvalue = tf.reduce_min(qvalue, axis=0)
       returns = tools.lambda_return(
           qval_reward, qvalue[:-1], pcont,
@@ -234,14 +233,14 @@ class SoftDenseDreamer(tools.Module):
       if self._c.distributed:
         actor_loss /= float(self._strategy.num_replicas_in_sync)
 
-    qvalue_t = [self._qvalue_t[i](imag_st_act).mode() for i in range(2)]
+    qvalue_t = [self._qvalue_t[i](imag_st_act).mode() for i in range(self._c.num_critics)]
     qvalue_t = tf.reduce_min(qvalue_t, axis=0)
     target = tf.stop_gradient(tools.lambda_return(
                                 qval_reward, qvalue_t[:-1], pcont,
                                 bootstrap=qvalue_t[-1], lambda_=self._c.disclam, axis=0))
     qvalue_loss = []
     qvalue_tape = []
-    for i in range(2):
+    for i in range(self._c.num_critics):
       with tf.GradientTape() as tape:
         qvalue_pred = self._qvalue[i](imag_st_act)[:-1]
         qvalue_loss.append(-tf.reduce_mean(discount * qvalue_pred.log_prob(target)))
@@ -261,7 +260,8 @@ class SoftDenseDreamer(tools.Module):
 
     model_norm = self._model_opt(model_tape, model_loss)
     actor_norm = self._actor_opt(actor_tape, actor_loss)
-    qvalue_norm = [self._qvalue_opt[i](qvalue_tape[i], qvalue_loss[i]) for i in range(2)]
+    qvalue_norm = [self._qvalue_opt[i](qvalue_tape[i], qvalue_loss[i]) 
+                    for i in range(self._c.num_critics)]
 
     if tf.distribute.get_replica_context().replica_id_in_sync_group == 0:
       if self._c.log_scalars:
@@ -288,10 +288,10 @@ class SoftDenseDreamer(tools.Module):
           (), 3, self._c.num_units, 'binary', act=act)
     q_input = (self._c.stoch_size + self._c.deter_size + self._actdim,)
     self._qvalue = [models.DenseDecoderV2(q_input, (), 3, self._c.num_units, act=act)
-                      for _ in range(2)]
+                      for _ in range(self._c.num_critics)]
     self._qvalue_t = [models.DenseDecoderV2(q_input, (), 3, self._c.num_units, act=act)
-                        for _ in range(2)]
-    [self._copy_weights(self._qvalue_t[i], self._qvalue[i]) for i in range(2)]
+                        for _ in range(self._c.num_critics)]
+    [self._copy_weights(self._qvalue_t[i], self._qvalue[i]) for i in range(self._c.num_critics)]
     self._actor = models.ActionDecoder(
         self._actdim, 4, self._c.num_units, self._c.action_dist,
         init_std=self._c.action_init_std, act=act)
@@ -313,7 +313,7 @@ class SoftDenseDreamer(tools.Module):
         wdpattern=self._c.weight_decay_pattern)
     self._model_opt = Optimizer('model', model_modules, self._c.model_lr)
     self._qvalue_opt = [Optimizer('qvalue_{}'.format(i+1), [self._qvalue[i]], self._c.value_lr)
-                          for i in range(2)]
+                          for i in range(self._c.num_critics)]
     self._actor_opt = Optimizer('actor', [self._actor], self._c.actor_lr)
 
     # Do a train step to initialize all variables, including optimizer
@@ -389,7 +389,7 @@ class SoftDenseDreamer(tools.Module):
       actor_norm, alpha_norm):
     self._metrics['model_grad_norm'].update_state(model_norm)
     [self._metrics['qvalue_{}_grad_norm'.format(i+1)].update_state(qvalue_norm[i])
-        for i in range(2)]
+        for i in range(self._c.num_critics)]
     self._metrics['actor_grad_norm'].update_state(actor_norm)
     self._metrics['prior_ent'].update_state(prior_dist.entropy())
     self._metrics['post_ent'].update_state(post_dist.entropy())
@@ -398,7 +398,7 @@ class SoftDenseDreamer(tools.Module):
     self._metrics['div'].update_state(div)
     self._metrics['model_loss'].update_state(model_loss)
     [self._metrics['qvalue_{}_loss'.format(i+1)].update_state(qvalue_loss[i])
-        for i in range(2)]
+        for i in range(self._c.num_critics)]
     self._metrics['actor_loss'].update_state(actor_loss)
     self._metrics['action_ent'].update_state(tf.reduce_mean(self._actor(feat).entropy()))
     if self._c.alpha == 'auto':
