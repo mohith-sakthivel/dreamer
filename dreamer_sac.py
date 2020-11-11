@@ -88,7 +88,7 @@ def define_config():
   # sac parameters
   config.alpha = 'auto'
   config.polyak_factor = None
-  config.t_update_freq = 5
+  config.t_update_freq = 1
   config.num_critics = 2
   # Behavior.
   config.discount = 0.99
@@ -187,7 +187,7 @@ class SoftDenseDreamer(tools.Module):
       self._strategy.experimental_run_v2(self._train, args=(data, log_images))
     else:
       self._train(next(self._dataset), log_images)
-    [self._copy_weights(self._qvalue_t[i], self._qvalue[i]) for i in range(self._c.num_critics)]
+    self._update_target()
 
   def _train(self, data, log_images):
     with tf.GradientTape() as model_tape:
@@ -233,17 +233,18 @@ class SoftDenseDreamer(tools.Module):
       if self._c.distributed:
         actor_loss /= float(self._strategy.num_replicas_in_sync)
 
-    qvalue_t = [self._qvalue_t[i](imag_st_act).mode() for i in range(self._c.num_critics)]
-    qvalue_t = tf.reduce_min(qvalue_t, axis=0)
-    target = tf.stop_gradient(tools.lambda_return(
-                                qval_reward, qvalue_t[:-1], pcont,
-                                bootstrap=qvalue_t[-1], lambda_=self._c.disclam, axis=0))
+    if self._use_target:
+      qvalue = [self._qvalue_t[i](imag_st_act).mode() for i in range(self._c.num_critics)]
+      qvalue = tf.reduce_min(qvalue, axis=0)
+      returns = tf.stop_gradient(tools.lambda_return(
+                                  qval_reward, qvalue[:-1], pcont,
+                                  bootstrap=qvalue[-1], lambda_=self._c.disclam, axis=0))
     qvalue_loss = []
     qvalue_tape = []
     for i in range(self._c.num_critics):
       with tf.GradientTape() as tape:
         qvalue_pred = self._qvalue[i](imag_st_act)[:-1]
-        qvalue_loss.append(-tf.reduce_mean(discount * qvalue_pred.log_prob(target)))
+        qvalue_loss.append(-tf.reduce_mean(discount * qvalue_pred.log_prob(tf.stop_gradient(returns))))
         if self._c.distributed:
           qvalue_loss[i] /= float(self._strategy.num_replicas_in_sync)
       qvalue_tape.append(tape)
@@ -289,9 +290,16 @@ class SoftDenseDreamer(tools.Module):
     q_input = (self._c.stoch_size + self._c.deter_size + self._actdim,)
     self._qvalue = [models.DenseDecoderV2(q_input, (), 3, self._c.num_units, act=act)
                       for _ in range(self._c.num_critics)]
-    self._qvalue_t = [models.DenseDecoderV2(q_input, (), 3, self._c.num_units, act=act)
-                        for _ in range(self._c.num_critics)]
-    [self._copy_weights(self._qvalue_t[i], self._qvalue[i]) for i in range(self._c.num_critics)]
+    self._use_target = (self._c.polyak_factor is not None or (self._c.t_update_freq is not None 
+                        and self._c.t_update_freq > 1))
+    if self._use_target:
+      self._qvalue_t = [models.DenseDecoderV2(q_input, (), 3, self._c.num_units, act=act)
+                          for _ in range(self._c.num_critics)]
+      self._update_target = lambda: [self._copy_weights(self._qvalue_t[i], self._qvalue[i]) 
+                                        for i in range(self._c.num_critics)]
+      self._update_target()
+    else:
+      self._update_target = lambda: None
     self._actor = models.ActionDecoder(
         self._actdim, 4, self._c.num_units, self._c.action_dist,
         init_std=self._c.action_init_std, act=act)
