@@ -4,8 +4,11 @@ import functools
 import json
 import os
 import pathlib
+from re import T
 import sys
 import time
+
+from tools import count_episodes, load_episodes, save_episodes
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['MUJOCO_GL'] = 'egl'
@@ -25,6 +28,7 @@ import tools
 import wrappers
 import environments
 import logger
+import custom_tools
 
 
 def define_config():
@@ -41,6 +45,7 @@ def define_config():
   config.log_images = False
   config.gpu_growth = True
   config.distributed = True
+  config.ram_buffer = True
   config.precision = 16
   # Environment.
   config.task = 'dmc_walker_walk'
@@ -89,7 +94,7 @@ def define_config():
   return config
 
 
-class DenseDreamer(tools.Module):
+class DreamerMod(tools.Module):
 
   def __init__(self, config, datadir, obsspace, actspace, writer):
     self._c = config
@@ -360,14 +365,14 @@ def preprocess(obs, config):
 
 
 def count_steps(datadir, config):
-  return tools.count_episodes(datadir)[1] * config.action_repeat
+  return count_episodes(datadir)[1] * config.action_repeat
 
 
 def load_dataset(directory, config):
-  episode = next(tools.load_episodes(directory, 1))
+  episode = next(load_episodes(directory, 1))
   types = {k: v.dtype for k, v in episode.items()}
   shapes = {k: (None,) + v.shape[1:] for k, v in episode.items()}
-  generator = lambda: tools.load_episodes(
+  generator = lambda: load_episodes(
       directory, config.train_steps, config.batch_length,
       config.dataset_balance)
   dataset = tf.data.Dataset.from_generator(generator, types, shapes)
@@ -378,7 +383,7 @@ def load_dataset(directory, config):
 
 
 def summarize_episode(episode, config, datadir, writer, prefix):
-  episodes, steps = tools.count_episodes(datadir)
+  episodes, steps = count_episodes(datadir)
   length = (len(episode['reward']) - 1) * config.action_repeat
   ret = episode['reward'].sum()
   print(f'{prefix.title()} episode of length {length} with return {ret:.1f}.')
@@ -394,59 +399,6 @@ def summarize_episode(episode, config, datadir, writer, prefix):
     [tf.summary.scalar('sim/' + k, v) for k, v in metrics]
     # if prefix == 'test':
     #   tools.video_summary(f'sim/{prefix}/video', episode['image'][None])
-
-class StudyBehaviour:
-  def __init__(self, batch_size, vid_logdir, fps=20):
-    self._batch_size = batch_size
-    self._vid_logdir = vid_logdir
-    self._fps = fps
-
-    self._b_step = None
-    self._b_data = {}
-    self._b_size = 0
-
-  def _load_metrics(self, metrics):
-    for key, val in metrics:
-      if key in self._b_data:
-        self._b_data[key].append(val)
-      else:
-        self._b_data[key] = [val]
-    self._b_size += 1
-
-  def _write_logs(self, writer):
-    with writer.as_default():  # Env might run in a different thread.
-      tf.summary.experimental.set_step(self._b_step)
-      for key, values in self._b_data.items():
-        tf.summary.scalar(key + '/mean', np.mean(values))
-        tf.summary.scalar(key + '/max', np.max(values))
-        tf.summary.scalar(key + '/min', np.min(values))
-
-    self._b_step = None
-    self._b_size = 0
-    self._b_data = {}
-
-  def __call__(self, episode, config, datadir, writer, prefix):
-    if self._b_step is None:
-      self._b_step = count_steps(datadir, config)
-
-    length = (len(episode['reward']) - 1) * config.action_repeat
-    ret = episode['reward'].sum()
-    print(f'{prefix.title()} episode of length {length} with return {ret:.1f}.')
-    metrics = [
-        (f'{prefix}/return', float(ret)),
-        (f'{prefix}/length', len(episode['reward']) - 1)]
-    
-    self._load_metrics(metrics)
-    with (config.logdir / 'metrics.jsonl').open('a') as f:
-      f.write(json.dumps(dict([('step', self._b_step)] + metrics)) + '\n')
-
-    dir = self._vid_logdir / 'step_{}'.format(self._b_step)
-    dir.mkdir(parents=True, exist_ok=True)
-    name = 'ep_{}_len_{}_ret_{}.mp4'.format(self._b_size, length, ret)
-    logger.make_video(episode['image'], str(dir / name), self._fps)
-    
-    if self._b_size == self._batch_size:
-      self._write_logs(writer)
 
 
 def make_env(config, writer, prefix, datadir, store, get_imgs=False):
@@ -469,18 +421,32 @@ def make_env(config, writer, prefix, datadir, store, get_imgs=False):
   env = wrappers.TimeLimit(env, config.time_limit / config.action_repeat)
   callbacks = []
   if store:
-    callbacks.append(lambda ep: tools.save_episodes(datadir, [ep]))
+    callbacks.append(lambda ep: save_episodes(datadir, [ep]))
   if prefix != 'study':
     callbacks.append(
         lambda ep: summarize_episode(ep, config, datadir, writer, prefix))
   else:
-    record_behaviour = StudyBehaviour(config.study_episodes,
-                                      config.logdir/'videos', env.fps)
+    record_behaviour = custom_tools.StudyBehaviour(config.study_episodes,
+                                  config.logdir/'videos', count_steps, env.fps)
     callbacks.append(
         lambda ep: record_behaviour(ep, config, datadir, writer, prefix))
   env = wrappers.Collect(env, callbacks, config.precision)
   env = wrappers.RewardObs(env)
   return env
+
+
+def setup_buffer(store_on_ram, ep_dir):
+  if store_on_ram:
+    buffer = custom_tools.DataBuffer(ep_dir)
+    count_episodes = lambda _: buffer.count_episodes()
+    save_episodes = lambda _, ep: buffer.save_episodes(ep)
+    def load_episodes(_, rescan, length=None, balance=False, seed=0):
+      buffer.load_episodes(rescan, length, balance, seed)
+  else:
+    count_episodes = tools.count_episodes
+    save_episodes = tools.save_episodes
+    load_episodes = tools.load_episodes
+  return count_episodes, save_episodes, load_episodes
 
 
 def main(Agent, config):
@@ -498,6 +464,7 @@ def main(Agent, config):
 
   # Create environments.
   datadir = config.logdir / 'episodes'
+  count_episodes, save_episodes, load_episodes = setup_buffer(config.ram_buffer, datadir)
   writer = tf.summary.create_file_writer(
       str(config.logdir), max_queue=1000, flush_millis=20000)
   writer.set_as_default()
@@ -560,4 +527,4 @@ if __name__ == '__main__':
   parser = argparse.ArgumentParser()
   for key, value in define_config().items():
     parser.add_argument(f'--{key}', type=tools.args_type(value), default=value)
-  main(DenseDreamer, parser.parse_args())
+  main(DreamerMod, parser.parse_args())

@@ -19,13 +19,13 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 import models
 import tools
 
-from densedreamer import DenseDreamer, main
+from dreamer_mod import DreamerMod, main
 
 
 def define_config():
   config = tools.AttrDict()
   # General.
-  config.logdir = pathlib.Path('./logs/dummy')
+  config.logdir = pathlib.Path('./logs')
   config.seed = 0
   config.steps = 5e6
   config.eval_every = 1e4
@@ -36,6 +36,7 @@ def define_config():
   config.log_images = False
   config.gpu_growth = True
   config.distributed = True
+  config.ram_buffer = True
   config.precision = 16
   # Environment.
   config.task = 'dmc_walker_walk'
@@ -47,10 +48,10 @@ def define_config():
   config.eval_noise = 0.0
   config.clip_rewards = 'none'
   # Model.
-  config.deter_size = 75
+  config.deter_size = 100
   config.stoch_size = 30
-  config.num_units = 100
-  config.embed_size = 50
+  config.num_units = 200
+  config.embed_size = 60
   config.dense_act = 'elu'
   config.cnn_act = 'relu'
   config.dnn_depth = 3
@@ -90,7 +91,7 @@ def define_config():
   return config
 
 
-class SoftDenseDreamer(DenseDreamer):
+class DreamerModSoft(DreamerMod):
 
   @tf.function()
   def train(self, data, log_images=False):
@@ -311,4 +312,4 @@ if __name__ == '__main__':
   parser = argparse.ArgumentParser()
   for key, value in define_config().items():
     parser.add_argument(f'--{key}', type=tools.args_type(value), default=value)
-  main(SoftDenseDreamer, parser.parse_args())
+  main(DreamerModSoft, parser.parse_args())
