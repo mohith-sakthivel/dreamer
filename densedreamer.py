@@ -1,10 +1,3 @@
-############################################################################
-# Metadreamer-v2:
-#   - Dreamer with with Conv layers replaced with Dense Layers 
-#   - Conv Encoder can be removed (by replacing self._encode)
-#     i.e. Observation can be directly used as an embedding
-############################################################################
-
 import argparse
 import collections
 import functools
@@ -490,7 +483,7 @@ def make_env(config, writer, prefix, datadir, store, get_imgs=False):
   return env
 
 
-def main(config):
+def main(Agent, config):
   if config.gpu_growth:
     for gpu in tf.config.experimental.list_physical_devices('GPU'):
       tf.config.experimental.set_memory_growth(gpu, True)
@@ -533,7 +526,7 @@ def main(config):
   # Train and regularly evaluate the agent.
   step = count_steps(datadir, config)
   print(f'Simulating agent for {config.steps-step} steps.')
-  agent = DenseDreamer(config, datadir, obsspace, actspace, writer)
+  agent = Agent(config, datadir, obsspace, actspace, writer)
   if (config.logdir / 'variables.pkl').exists():
     print('Load checkpoint.')
     agent.load(config.logdir / 'variables.pkl')
@@ -567,4 +560,4 @@ if __name__ == '__main__':
   parser = argparse.ArgumentParser()
   for key, value in define_config().items():
     parser.add_argument(f'--{key}', type=tools.args_type(value), default=value)
-  main(parser.parse_args())
+  main(DenseDreamer, parser.parse_args())
