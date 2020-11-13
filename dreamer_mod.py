@@ -46,7 +46,7 @@ def define_config():
   config.gpu_growth = True
   config.distributed = True
   config.ram_buffer = True
-  config.precision = 16
+  config.precision = 32
   # Environment.
   config.task = 'dmc_walker_walk'
   config.envs = 1
