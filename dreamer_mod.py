@@ -27,7 +27,6 @@ import models
 import tools
 import wrappers
 import environments
-import logger
 import custom_tools
 
 
@@ -459,7 +458,7 @@ def main(Agent, config):
   config.steps = int(config.steps)
   config.logdir.mkdir(parents=True, exist_ok=True)
   print('Logdir', config.logdir)
-  logger.save_config(config)
+  custom_tools.save_config(config)
   assert config.study_every is None or (config.study_every/config.eval_every) >= 5
 
   # Create environments.
@@ -478,7 +477,7 @@ def main(Agent, config):
     study_envs = [wrappers.Async(lambda: make_env(
         config, writer, 'study', datadir, store=False, get_imgs=True), config.parallel)
         for _ in range(config.envs)]
-  should_study = logger.IntervalCheck(config.study_every)
+  should_study = custom_tools.IntervalCheck(config.study_every)
   actspace = train_envs[0].action_space
   obsspace = train_envs[0].observation_space
 

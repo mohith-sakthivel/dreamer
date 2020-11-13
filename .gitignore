@@ -5,8 +5,7 @@ __pycache__/
 ./logdir
 MUJOCO_LOG.TXT
 .vscode/
-archived/
+reference_logs/
 logs/
-rough-work.ipynb
 runner.py
-.ipynb_checkpoints/
+test/
