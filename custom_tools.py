@@ -202,6 +202,7 @@ def make_video(img_list, video_dir='videos/vid.mp4', fps=20):
         out.write(image)
     out.release()
 
+
 class IntervalCheck():
     def __init__(self, interval=None):
         self._interval = interval
